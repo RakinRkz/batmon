@@ -1,0 +1,5 @@
+build/
+*.jks
+*.keystore
+*.pass
+.claude/settings.local.json

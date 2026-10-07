@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="page">#0D0D0D</color>
+    <color name="surface">#1A1A19</color>
+    <color name="ink">#FFFFFF</color>
+    <color name="ink2">#C3C2B7</color>
+    <color name="muted">#898781</color>
+    <color name="grid">#2C2C2A</color>
+    <color name="baseline">#383835</color>
+    <color name="border">#1AFFFFFF</color>
+    <color name="accent">#3987E5</color>
+    <color name="series_level">#3987E5</color>
+    <color name="series_temp">#9085E9</color>
+</resources>

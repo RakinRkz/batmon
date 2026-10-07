@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./build.sh)",
+      "Bash(./build.sh build)",
+      "Bash(./build.sh install)",
+      "Bash(./build.sh run)",
+      "Bash(adb devices)",
+      "Bash(adb devices -l)",
+      "Bash(adb install -r build/BatMon.apk)",
+      "Bash(adb shell am start -n com.opendroid.batmon/.MainActivity)",
+      "Bash(adb logcat -d *)",
+      "Bash(adb shell pidof com.opendroid.batmon)",
+      "Bash(adb shell dumpsys battery)",
+      "Bash(adb shell dumpsys activity services com.opendroid.batmon)",
+      "Bash(adb shell dumpsys notification *)",
+      "Bash(adb shell dumpsys power *)",
+      "Bash(adb shell getprop *)",
+      "Bash(adb exec-out screencap -p *)",
+      "Bash(adb shell uiautomator dump *)",
+      "Bash(adb shell input *)",
+      "Bash(adb shell cmd statusbar *)"
+    ],
+    "ask": [
+      "Bash(adb uninstall *)",
+      "Bash(adb shell pm clear *)",
+      "Bash(adb shell dumpsys battery set *)",
+      "Bash(adb shell dumpsys battery unplug *)",
+      "Bash(adb shell cmd uimode *)"
+    ]
+  }
+}

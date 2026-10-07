@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Light theme tokens. Dark values live in values-night/colors.xml. -->
+<resources>
+    <color name="page">#F4F4F1</color>
+    <color name="surface">#FCFCFB</color>
+    <color name="ink">#0B0B0B</color>
+    <color name="ink2">#52514E</color>
+    <color name="muted">#898781</color>
+    <color name="grid">#E1E0D9</color>
+    <color name="baseline">#C3C2B7</color>
+    <color name="border">#1A0B0B0B</color>
+    <color name="accent">#2A78D6</color>
+    <color name="series_level">#2A78D6</color>
+    <color name="series_temp">#4A3AA7</color>
+    <!-- Status colors are identical in both themes. -->
+    <color name="good">#0CA30C</color>
+    <color name="warning">#FAB219</color>
+    <color name="serious">#EC835A</color>
+    <color name="critical">#D03B3B</color>
+    <color name="launcher_bg">#12784A</color>
+</resources>
