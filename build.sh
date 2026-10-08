@@ -10,8 +10,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 export MIN_SDK=26 TARGET_SDK=35
-export VERSION_CODE=${VERSION_CODE:-1} VERSION_NAME=${VERSION_NAME:-1.0.0}
+export VERSION_CODE=${VERSION_CODE:-2} VERSION_NAME=${VERSION_NAME:-1.0.1}
 cmd=${1:-build}
+
+# Ship the license texts inside the APK: distributing the APK distributes the bundled icons too.
+mkdir -p assets/licenses
+cp LICENSE assets/licenses/LICENSE.txt
+cp THIRD_PARTY_NOTICES.md assets/licenses/THIRD_PARTY_NOTICES.md
 
 if [ "$cmd" = release ]; then
     [ -n "${KEYSTORE:-}" ] && [ -n "${KS_PASS:-}" ] || {

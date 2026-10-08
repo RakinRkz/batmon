@@ -52,6 +52,14 @@ public final class Fmt {
         return String.format(Locale.getDefault(), "%,d mAh", Math.round(mah));
     }
 
+    /** "+3,550 mAh" or "−45 mAh". */
+    public static String signedMah(double mah) {
+        if (Double.isNaN(mah)) return DASH;
+        long v = Math.round(mah);
+        String s = String.format(Locale.getDefault(), "%,d\u00a0mAh", Math.abs(v));
+        return v > 0 ? "+" + s : v < 0 ? MINUS + s : s;
+    }
+
     public static String percent(double p) {
         if (Double.isNaN(p)) return DASH;
         return String.format(Locale.getDefault(), "%.0f %%", p);

@@ -25,11 +25,14 @@ public final class Prefs {
     // Learned / internal state
     public static final String LEARNED_MICROAMPS = "learned_ua";
     public static final String LEARNED_INVERTED = "learned_inverted";
-    public static final String CHARGE_ALERT_SESSION = "charge_alert_session";
-    public static final String LOW_ALERT_SESSION = "low_alert_session";
+    /** Android 8 reports an unsupported CURRENT_NOW as 0; a 0 only counts once a non-zero was seen. */
+    public static final String CURRENT_NONZERO_SEEN = "current_nonzero_seen";
+    /** Set once the level is below the charge limit; the alert fires when charging reaches it. */
+    public static final String CHARGE_ALERT_ARMED = "charge_alert_armed";
+    /** Set once the level is above the low-battery level; the alert fires when it falls to it. */
+    public static final String LOW_ALERT_ARMED = "low_alert_armed";
     public static final String TEMP_ALERT_ACTIVE = "temp_alert_active";
     public static final String ASKED_NOTIF_PERMISSION = "asked_notif_permission";
-    public static final String TAB = "tab";
 
     private static Prefs instance;
     private final SharedPreferences sp;
@@ -43,8 +46,6 @@ public final class Prefs {
         return instance;
     }
 
-    public SharedPreferences raw() { return sp; }
-
     public boolean bool(String key) {
         switch (key) {
             case MONITOR:
@@ -52,6 +53,7 @@ public final class Prefs {
             case ALERT_CHARGE:
             case ALERT_LOW:
             case ALERT_TEMP:
+            case LOW_ALERT_ARMED:
                 return sp.getBoolean(key, true);
             default:
                 return sp.getBoolean(key, false);
@@ -80,10 +82,12 @@ public final class Prefs {
         }
     }
 
-    public long longValue(String key) { return sp.getLong(key, -1); }
-
     public void put(String key, boolean v) { sp.edit().putBoolean(key, v).apply(); }
     public void put(String key, int v) { sp.edit().putInt(key, v).apply(); }
-    public void put(String key, long v) { sp.edit().putLong(key, v).apply(); }
     public void put(String key, String v) { sp.edit().putString(key, v).apply(); }
+
+    /** Writes only when the value changes, for flags checked on every sample. */
+    public void set(String key, boolean v) {
+        if (bool(key) != v) put(key, v);
+    }
 }

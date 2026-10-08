@@ -16,7 +16,9 @@ scripts/setup-toolchain.sh   # one-time: JDK 17 + SDK platform 35 + build-tools 
 KEYSTORE=… KS_PASS=… ./build.sh release   # → build/BatMon-<version>.apk + .sha256, prints cert digest
 ```
 
-- `build.sh` sets `MIN_SDK=26`, `TARGET_SDK=35` and the version, then calls `scripts/build-apk.sh`.
+- `build.sh` sets `MIN_SDK=26`, `TARGET_SDK=35` and the version, and copies `LICENSE` and
+  `THIRD_PARTY_NOTICES.md` into `assets/licenses/` (git-ignored) so they ship in the APK. Then it calls
+  `scripts/build-apk.sh`.
   The version comes from `VERSION_CODE` / `VERSION_NAME`, with defaults in `build.sh`. The script runs
   aapt2 → javac `--release 8` → d8 → zipalign → apksigner. It uses the toolchain in
   `~/.local/share/android-min-toolchain`.
@@ -63,21 +65,26 @@ KEYSTORE=… KS_PASS=… ./build.sh release   # → build/BatMon-<version>.apk +
 
 Data flows one way: `BatteryReader` → `BatterySnapshot` → consumers. There are two independent consumers.
 
-1. **`MonitorService`** is a foreground service of type `specialUse`. Its handler tick runs every
-   `INTERVAL` seconds while the screen is on, every 60 s while it is off, and every 15 s while charging
-   if the wakelock option is on. Screen and plug broadcasts and level changes also trigger a tick.
-   Each tick:
+1. **`MonitorService`** is a foreground service of type `specialUse`. All its work (ticks, broadcasts,
+   database writes, notifications) runs on one `HandlerThread` ("BatMonMonitor"); the main thread only
+   starts and stops it. The tick runs every `INTERVAL` seconds while the screen is on, every 15 s while
+   the wakelock is held, and every 60 s otherwise. Screen and plug broadcasts and level changes also
+   trigger a tick. Intervals and throttles use `elapsedRealtime` (`BatterySnapshot.elapsed`), never the
+   wall clock. The wakelock is held only while status is CHARGING and the level is below 100. Each tick:
    - feeds `SessionTracker`, which splits samples into charge (plugged) and discharge sessions, integrates
      current as mAh, attributes each interval to the screen state at its start, and persists the open
      session every tick;
    - writes a sample to `HistoryDb` (SQLite, WAL), at most once per 15 s (session integration still uses every tick);
    - runs `Alerts.check`;
-   - re-posts the notification and its text-bitmap status-bar icon.
+   - re-posts the notification and its text-bitmap status-bar icon, but only when their content
+     changed.
 
-   `BootReceiver` restarts the service after `BOOT_COMPLETED` and `MY_PACKAGE_REPLACED`.
+   `BootReceiver` restarts the service after `BOOT_COMPLETED` and `MY_PACKAGE_REPLACED`. `onDestroy`
+   closes the open session on the worker thread.
 2. **The UI** is `MainActivity`, which hosts four `ui/*Page` objects behind a custom bottom nav, with
-   `onShow` / `onHide` tied to resume and pause. `DashboardPage` samples on its own 1 s ticker and keeps
-   an in-memory `LiveStats`; it does not talk to the service. `HistoryPage` and `HealthPage` query
+   `onShow` / `onHide` tied to resume and pause. `DashboardPage` samples on its own 1 s ticker into a
+   process-wide `Live` holder (so it survives recreation), which a plug-state receiver resets; it does
+   not talk to the service. The headline averages only readings from the last N seconds. `HistoryPage` and `HealthPage` query
    `HistoryDb` on the `HistoryDb.IO` executor. `ChartView` is the single custom time-series view.
 
 The service and the UI share `Prefs` (typed SharedPreferences; the defaults live in its `bool` / `integer`
@@ -90,7 +97,11 @@ The service and the UI share `Prefs` (typed SharedPreferences; the defaults live
 - The sign convention varies too. Auto mode learns it from readings taken while unplugged and
   DISCHARGING, and needs 5 consistent votes before flipping. Internally, + always means current into the
   battery.
-- Both learned values live in `Prefs` and can be pinned in Settings. Changing either setting resets them.
+- Both learned values live in `Prefs` and can be pinned in Settings. Changing a setting doesn't reset
+  them. Sign votes count only distinct readings taken at least 15 s after the reader last saw the phone
+  plugged in.
+- Before Android 9, `getIntProperty` returns 0 (not MIN_VALUE) for unsupported properties, so on
+  API < 28 a 0 current counts as unsupported until a non-zero reading has been seen.
 - Design capacity comes from, in order: the user override, the Android 16 broadcast extra
   `android.os.extra.DESIGN_CAPACITY` (µAh), then the hidden `PowerProfile.getBatteryCapacity()` via
   reflection.
@@ -105,8 +116,22 @@ Full capacity comes from the first available of:
 3. The 7-day median of charge counter ÷ level, from samples at ≥ 30 %, bounded to 30–130 % of design
    capacity.
 
-`SessionTracker` taints a session (adds a huge `gapMs`) when the level jumps by more than 3 points in
-under a minute. That keeps faked or glitched states out of the estimates.
+### Sessions (`SessionTracker`)
+
+- Current is integrated with the trapezoid rule only between samples ≤ 90 s apart. Longer spans (the
+  CPU slept) use the charge counter's delta and count as unmeasured (`gapMs`).
+- A session left open by an earlier run is resumed only after a pause of ≤ 30 min with the level still
+  moving the session's way; otherwise it is closed and a new one starts.
+- If `updateSession` finds the row gone (Clear history), a new session starts from the current sample.
+- A session is tainted (a year added to `gapMs`) when the level moves more than twice what the measured
+  current allows plus 3 points (faked states), or when the current's unit or sign convention changes
+  mid-session.
+
+### Alerts
+
+The level alerts use armed flags in `Prefs`, not session ids. Charge limit arms at ≤ limit − 3 and fires
+when plugged in at ≥ limit. Low battery arms at ≥ level + 3 and fires when unplugged at ≤ level. The
+temperature alert is per overheating episode, and turning it off ends the episode.
 
 ## Testing with simulated battery states
 

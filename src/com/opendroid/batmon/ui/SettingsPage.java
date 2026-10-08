@@ -68,11 +68,14 @@ public final class SettingsPage extends Page {
         }
 
         section(col, "Alerts");
-        switchRow("Charge limit alert", "Notify when charging reaches the limit", Prefs.ALERT_CHARGE, null);
+        switchRow("Charge limit alert", "Notify when charging reaches the limit", Prefs.ALERT_CHARGE,
+                on -> MonitorService.refresh(act));
         choiceRow("Charge limit", null, Prefs.ALERT_CHARGE_LEVEL, percentLabels(60, 100, 5), range(60, 100, 5));
-        switchRow("Low battery alert", "Notify when discharging falls to the level", Prefs.ALERT_LOW, null);
+        switchRow("Low battery alert", "Notify when discharging falls to the level", Prefs.ALERT_LOW,
+                on -> MonitorService.refresh(act));
         choiceRow("Low battery level", null, Prefs.ALERT_LOW_LEVEL, percentLabels(5, 50, 5), range(5, 50, 5));
-        switchRow("High temperature alert", "Notify when the battery gets too hot", Prefs.ALERT_TEMP, null);
+        switchRow("High temperature alert", "Notify when the battery gets too hot", Prefs.ALERT_TEMP,
+                on -> MonitorService.refresh(act));
         int[] temps = range(35, 50, 1);
         String[] tempLabels = new String[temps.length];
         for (int i = 0; i < temps.length; i++) tempLabels[i] = temps[i] + " °C";
@@ -96,7 +99,7 @@ public final class SettingsPage extends Page {
         }, this::editDesignCapacity);
 
         section(col, "Data");
-        choiceRow("Keep history for", null, Prefs.HISTORY_DAYS,
+        choiceRow("Keep chart data for", "sessions are kept for a year", Prefs.HISTORY_DAYS,
                 new String[] {"7 days", "14 days", "30 days", "90 days"}, new int[] {7, 14, 30, 90});
         actionRow("Clear history", () -> "Delete all samples and sessions", this::confirmClear);
         actionRow("Raw battery values", () -> "What the phone reports, for troubleshooting", this::showDiagnostics);
@@ -118,11 +121,29 @@ public final class SettingsPage extends Page {
     private static final String REPO_URL = "https://github.com/RakinRkz/batmon";
 
     private void openUrl(String url) {
-        try {
-            act.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-        } catch (android.content.ActivityNotFoundException e) {
+        if (!startFirst(new Intent(Intent.ACTION_VIEW, Uri.parse(url)))) {
             Toast.makeText(act, url, Toast.LENGTH_LONG).show();
         }
+    }
+
+    /**
+     * Starts the first intent some app handles. TV, Automotive and some OEM builds lack several
+     * Settings screens, and starting a missing one throws.
+     */
+    private boolean startFirst(Intent... candidates) {
+        for (Intent i : candidates) {
+            try {
+                act.startActivity(i);
+                return true;
+            } catch (RuntimeException ignored) {
+                // ActivityNotFoundException, or SecurityException on locked-down builds
+            }
+        }
+        return false;
+    }
+
+    private void notAvailable() {
+        Toast.makeText(act, "Not available on this device", Toast.LENGTH_SHORT).show();
     }
 
     @Override
@@ -247,13 +268,9 @@ public final class SettingsPage extends Page {
 
     private void afterChange(String key) {
         switch (key) {
+            // Learned unit and sign are kept: auto-detect picks up where it left off if chosen again.
             case Prefs.CURRENT_UNIT:
             case Prefs.CURRENT_SIGN:
-                // Re-learn from scratch when the user goes back to auto-detect.
-                prefs.put(Prefs.LEARNED_MICROAMPS, false);
-                prefs.put(Prefs.LEARNED_INVERTED, false);
-                MonitorService.refresh(act);
-                break;
             case Prefs.INTERVAL:
             case Prefs.NOTIF_ICON:
             case Prefs.FAHRENHEIT:
@@ -290,21 +307,21 @@ public final class SettingsPage extends Page {
     }
 
     private void requestUnrestricted() {
-        if (isIgnoringOptimizations()) {
-            act.startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
-            return;
-        }
-        try {
-            act.startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    Uri.parse("package:" + act.getPackageName())));
-        } catch (RuntimeException e) {
-            act.startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
-        }
+        Intent list = new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+        Intent details = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:" + act.getPackageName()));
+        boolean started = isIgnoringOptimizations() ? startFirst(list, details)
+                : startFirst(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + act.getPackageName())), list, details);
+        if (!started) notAvailable();
     }
 
     private void openNotificationSettings() {
-        act.startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                .putExtra(Settings.EXTRA_APP_PACKAGE, act.getPackageName()));
+        boolean started = startFirst(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, act.getPackageName()),
+                new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + act.getPackageName())));
+        if (!started) notAvailable();
     }
 
     private void editDesignCapacity() {

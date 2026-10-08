@@ -6,6 +6,7 @@ import android.content.IntentFilter;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -15,13 +16,17 @@ import java.util.TreeSet;
  * Reads the battery and normalizes what devices disagree on: CURRENT_NOW comes in µA on most
  * phones but mA on some (older Samsung), and a few report the sign inverted. Both are learned
  * from the readings themselves unless the user pins them in Settings.
+ *
+ * Instances keep sign-learning state, so each thread uses its own.
  */
 public final class BatteryReader {
     private static final IntentFilter BATTERY_CHANGED = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
     /** No phone draws 15 A, so any |reading| above this must be µA. */
     private static final int MICROAMP_THRESHOLD = 15_000;
-    /** Consecutive unplugged readings needed before flipping the learned sign. */
+    /** Distinct unplugged readings that must agree before the learned sign flips. */
     private static final int SIGN_VOTES = 5;
+    /** Ignore readings this soon after unplugging; some gauges lag behind the plug state. */
+    private static final long UNPLUG_SETTLE_MS = 15_000;
 
     // Battery-changed extras added in Android 16, in µAh. Not in the public SDK, so read by name.
     private static final String EXTRA_MAXIMUM_CAPACITY = "android.os.extra.MAXIMUM_CAPACITY";
@@ -33,6 +38,8 @@ public final class BatteryReader {
     private final BatteryManager bm;
     private final Prefs prefs;
     private int signVotes;
+    private int lastVoteRaw = Integer.MIN_VALUE;
+    private long lastPluggedElapsed = -1;
 
     public BatteryReader(Context c) {
         ctx = c.getApplicationContext();
@@ -51,6 +58,7 @@ public final class BatteryReader {
     public BatterySnapshot read(Intent i) {
         BatterySnapshot s = new BatterySnapshot();
         s.time = System.currentTimeMillis();
+        s.elapsed = SystemClock.elapsedRealtime();
         if (i != null) {
             int level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
             int scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
@@ -59,7 +67,6 @@ public final class BatteryReader {
             s.plugged = i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
             s.health = i.getIntExtra(BatteryManager.EXTRA_HEALTH, BatteryManager.BATTERY_HEALTH_UNKNOWN);
             s.technology = i.getStringExtra(BatteryManager.EXTRA_TECHNOLOGY);
-            s.present = i.getBooleanExtra(BatteryManager.EXTRA_PRESENT, true);
             s.voltageMv = normalizeVoltage(i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0));
             int t = i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
             if (t != Integer.MIN_VALUE) s.tempC = t / 10f;
@@ -68,64 +75,96 @@ public final class BatteryReader {
                 if (cycles >= 0) s.cycleCount = cycles;
             }
             s.maxCapacityMah = capacityExtraMah(i, EXTRA_MAXIMUM_CAPACITY);
-            s.designCapacityMah = capacityExtraMah(i, EXTRA_DESIGN_CAPACITY);
         }
+        if (s.isPlugged()) lastPluggedElapsed = s.elapsed;
         if (bm != null) {
             int raw = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW);
             s.rawCurrent = raw;
-            if (raw != Integer.MIN_VALUE) s.currentMa = normalizeCurrent(raw, s, true);
-            int avg = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE);
-            if (avg != Integer.MIN_VALUE && avg != 0) s.currentAvgMa = normalizeCurrent(avg, s, false);
-            int counter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER);
-            if (counter > 0 && counter != Integer.MIN_VALUE) {
-                // A handful of devices report mAh instead of µAh.
-                s.chargeCounterUah = counter < 20_000 && s.level > 5 ? counter * 1000L : counter;
+            if (raw != Integer.MIN_VALUE && !zeroMeansUnsupported(raw)) {
+                boolean microAmps = learnUnit(raw);
+                int ma = microAmps ? raw / 1000 : raw;
+                boolean inverted = learnSign(raw, ma, s);
+                s.currentMa = inverted ? -ma : ma;
+                s.convention = (microAmps ? 1 : 0) | (inverted ? 2 : 0);
             }
+            int counter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER);
+            if (counter > 0 && counter != Integer.MIN_VALUE) s.chargeCounterUah = normalizeCounter(counter);
             if (Build.VERSION.SDK_INT >= 28) s.chargeTimeRemainingMs = bm.computeChargeTimeRemaining();
         }
         return s;
     }
 
-    private int normalizeCurrent(int raw, BatterySnapshot s, boolean learn) {
-        boolean microAmps;
-        String unit = prefs.string(Prefs.CURRENT_UNIT);
-        if ("ua".equals(unit)) {
-            microAmps = true;
-        } else if ("ma".equals(unit)) {
-            microAmps = false;
-        } else {
-            if (learn && Math.abs(raw) >= MICROAMP_THRESHOLD && !prefs.bool(Prefs.LEARNED_MICROAMPS)) {
-                prefs.put(Prefs.LEARNED_MICROAMPS, true);
-            }
-            microAmps = prefs.bool(Prefs.LEARNED_MICROAMPS);
+    /**
+     * Before Android 9, getIntProperty returned 0 rather than MIN_VALUE for an unsupported property,
+     * so there a 0 only counts as a real reading once the phone has reported a non-zero current.
+     */
+    private boolean zeroMeansUnsupported(int raw) {
+        if (Build.VERSION.SDK_INT >= 28) return false;
+        if (raw != 0) {
+            prefs.set(Prefs.CURRENT_NONZERO_SEEN, true);
+            return false;
         }
-        int ma = microAmps ? raw / 1000 : raw;
+        return !prefs.bool(Prefs.CURRENT_NONZERO_SEEN);
+    }
 
-        boolean inverted;
-        String sign = prefs.string(Prefs.CURRENT_SIGN);
-        if ("normal".equals(sign)) {
-            inverted = false;
-        } else if ("inverted".equals(sign)) {
-            inverted = true;
-        } else {
-            boolean learned = prefs.bool(Prefs.LEARNED_INVERTED);
-            // Unplugged, the battery can only discharge, so the reading's sign tells us the convention.
-            if (learn && !s.isPlugged() && s.status == BatteryManager.BATTERY_STATUS_DISCHARGING
-                    && Math.abs(ma) >= 20) {
-                boolean looksInverted = ma > 0;
-                if (looksInverted != learned) {
-                    if (++signVotes >= SIGN_VOTES) {
-                        prefs.put(Prefs.LEARNED_INVERTED, looksInverted);
-                        learned = looksInverted;
-                        signVotes = 0;
-                    }
-                } else {
-                    signVotes = 0;
-                }
-            }
-            inverted = learned;
+    private boolean learnUnit(int raw) {
+        if ("auto".equals(prefs.string(Prefs.CURRENT_UNIT)) && Math.abs(raw) >= MICROAMP_THRESHOLD) {
+            prefs.set(Prefs.LEARNED_MICROAMPS, true);
         }
-        return inverted ? -ma : ma;
+        return usesMicroAmps(prefs);
+    }
+
+    /**
+     * Unplugged, the battery can only discharge, so the reading's sign tells us the convention. Only
+     * readings that differ from the previous vote count, so a gauge stuck on its last charging value
+     * can't outvote the real discharge.
+     */
+    private boolean learnSign(int raw, int ma, BatterySnapshot s) {
+        if ("auto".equals(prefs.string(Prefs.CURRENT_SIGN)) && !s.isPlugged()
+                && s.status == BatteryManager.BATTERY_STATUS_DISCHARGING && Math.abs(ma) >= 20
+                && (lastPluggedElapsed < 0 || s.elapsed - lastPluggedElapsed > UNPLUG_SETTLE_MS)
+                && raw != lastVoteRaw) {
+            lastVoteRaw = raw;
+            boolean looksInverted = ma > 0;
+            if (looksInverted == prefs.bool(Prefs.LEARNED_INVERTED)) {
+                signVotes = 0;
+            } else if (++signVotes >= SIGN_VOTES) {
+                prefs.set(Prefs.LEARNED_INVERTED, looksInverted);
+                signVotes = 0;
+            }
+        }
+        return isInverted(prefs);
+    }
+
+    /** Whether raw current is treated as µA: pinned in Settings, or learned. */
+    public static boolean usesMicroAmps(Prefs p) {
+        String unit = p.string(Prefs.CURRENT_UNIT);
+        return "ua".equals(unit) || (!"ma".equals(unit) && p.bool(Prefs.LEARNED_MICROAMPS));
+    }
+
+    /** Whether the raw sign is flipped: pinned in Settings, or learned. */
+    public static boolean isInverted(Prefs p) {
+        String sign = p.string(Prefs.CURRENT_SIGN);
+        return "inverted".equals(sign) || (!"normal".equals(sign) && p.bool(Prefs.LEARNED_INVERTED));
+    }
+
+    /** "µA (auto-detected), sign normal (set in Settings)" and the like. */
+    public static String conventionSummary(Prefs p) {
+        boolean unitAuto = "auto".equals(p.string(Prefs.CURRENT_UNIT));
+        boolean signAuto = "auto".equals(p.string(Prefs.CURRENT_SIGN));
+        return (usesMicroAmps(p) ? "µA" : "mA") + (unitAuto ? " (auto-detected)" : " (set in Settings)")
+                + ", sign " + (isInverted(p) ? "inverted" : "normal")
+                + (signAuto ? " (auto-detected)" : " (set in Settings)");
+    }
+
+    /**
+     * CHARGE_COUNTER is µAh per the docs, but a few devices report mAh. A mAh value can't exceed the
+     * battery's capacity, while a µAh value is that small only within a few mAh of empty.
+     */
+    private long normalizeCounter(int counter) {
+        int design = designCapacityMah(ctx);
+        long mahLimit = design > 0 ? design * 3L / 2 : 20_000;
+        return counter <= mahLimit ? counter * 1000L : counter;
     }
 
     private static int capacityExtraMah(Intent i, String key) {
@@ -184,9 +223,8 @@ public final class BatteryReader {
                 rows.add(row("computeChargeTimeRemaining", String.valueOf(bm.computeChargeTimeRemaining())));
             }
         }
-        rows.add(row("Learned unit", prefs.bool(Prefs.LEARNED_MICROAMPS) ? "µA" : "mA"));
-        rows.add(row("Learned sign", prefs.bool(Prefs.LEARNED_INVERTED) ? "inverted" : "normal"));
-        rows.add(row("PowerProfile capacity", systemDesignCapacityMah(ctx) + " mAh"));
+        rows.add(row("Current", conventionSummary(prefs)));
+        rows.add(row("Design capacity (system)", systemDesignCapacityMah(ctx) + " mAh"));
         Intent i = stickyIntent();
         Bundle extras = i != null ? i.getExtras() : null;
         if (extras != null) {
@@ -199,7 +237,9 @@ public final class BatteryReader {
 
     private String prop(int id) {
         int v = bm.getIntProperty(id);
-        return v == Integer.MIN_VALUE ? "unsupported" : String.valueOf(v);
+        if (v == Integer.MIN_VALUE) return "unsupported";
+        if (v == 0 && Build.VERSION.SDK_INT < 28) return "0 (Android 8 also reports unsupported as 0)";
+        return String.valueOf(v);
     }
 
     private String longProp(int id) {

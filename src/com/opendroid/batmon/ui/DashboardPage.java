@@ -1,5 +1,9 @@
 package com.opendroid.batmon.ui;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
@@ -18,21 +22,55 @@ import com.opendroid.batmon.Prefs;
 
 import java.util.Locale;
 
-/** Live readout: headline current, session min/avg/max, a 3-minute chart and every battery value. */
+/** Live readout: headline current, min/avg/max, a 3-minute chart and every battery value. */
 public final class DashboardPage extends Page {
     private static final long TICK_MS = 1000;
     private static final long LIVE_WINDOW_MS = 3 * 60_000;
     private static final int LIVE_CAP = 200;
 
+    /**
+     * Readings collected while the page is visible. Process-wide so they survive rotation and theme
+     * changes, and reset by a plug-state broadcast even while the page is hidden.
+     */
+    private static final class Live {
+        private static Live instance;
+        final LiveStats stats = new LiveStats(64);
+        final long[] t = new long[LIVE_CAP];
+        final float[] v = new float[LIVE_CAP];
+        int n;
+
+        static Live get(Context c) {
+            if (instance == null) {
+                instance = new Live();
+                IntentFilter f = new IntentFilter(Intent.ACTION_POWER_CONNECTED);
+                f.addAction(Intent.ACTION_POWER_DISCONNECTED);
+                c.getApplicationContext().registerReceiver(new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context ctx, Intent i) {
+                        instance.stats.reset(); // min/avg/max describe the current plug state only
+                    }
+                }, f);
+            }
+            return instance;
+        }
+
+        void push(long time, float value) {
+            if (n == LIVE_CAP) {
+                System.arraycopy(t, 1, t, 0, LIVE_CAP - 1);
+                System.arraycopy(v, 1, v, 0, LIVE_CAP - 1);
+                n--;
+            }
+            t[n] = time;
+            v[n] = value;
+            n++;
+        }
+    }
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable tick = this::tick;
     private final BatteryReader reader;
     private final Prefs prefs;
-    private final LiveStats stats = new LiveStats(64);
-    private final long[] liveT = new long[LIVE_CAP];
-    private final float[] liveV = new float[LIVE_CAP];
-    private int liveN;
-    private int lastPlugged = -1;
+    private final Live live;
 
     private LinearLayout heroCard, pill;
     private View pillDot;
@@ -45,6 +83,7 @@ public final class DashboardPage extends Page {
         super(act);
         reader = new BatteryReader(act);
         prefs = Prefs.get(act);
+        live = Live.get(act);
     }
 
     @Override
@@ -55,11 +94,12 @@ public final class DashboardPage extends Page {
         LinearLayout titleRow = ui.horizontal();
         TextView title = ui.pageTitle("BatMon");
         titleRow.addView(title, Ui.weighted());
-        TextView reset = ui.medium("Reset stats", 14, ui.accent);
-        reset.setPadding(ui.dp(12), ui.dp(10), ui.dp(4), ui.dp(10));
+        TextView reset = ui.medium("Reset stats", 13, ui.ink2);
+        reset.setBackground(ui.rounded(ui.surface, 999, ui.border));
+        reset.setPadding(ui.dp(14), ui.dp(8), ui.dp(14), ui.dp(8));
         reset.setOnClickListener(v -> {
-            stats.reset();
-            liveN = 0;
+            live.stats.reset();
+            live.n = 0;
             tick();
         });
         titleRow.addView(reset);
@@ -74,7 +114,7 @@ public final class DashboardPage extends Page {
                 .minSpan(100)
                 .relativeTime(true)
                 .gap(5000)
-                .axisFormat(v -> axisMa(v))
+                .axisFormat(DashboardPage::axisMa)
                 .tipFormat(v -> Fmt.signedMa(Math.round(v)) + " mA")
                 .tipTime(t -> Fmt.timeSec(act, t))
                 .emptyText("Waiting for readings…");
@@ -167,36 +207,23 @@ public final class DashboardPage extends Page {
     private void tick() {
         handler.removeCallbacks(tick);
         BatterySnapshot s = reader.read();
-        if (s.plugged != lastPlugged) {
-            if (lastPlugged != -1) stats.reset(); // min/max/avg describe the current plug state only
-            lastPlugged = s.plugged;
-        }
         if (s.hasCurrent()) {
-            stats.add(s.currentMa);
-            pushLive(s.time, s.currentMa);
+            live.stats.add(s.currentMa, s.elapsed);
+            live.push(s.time, s.currentMa);
         }
+        chart.setRange(s.time - LIVE_WINDOW_MS, s.time);
+        chart.setData(live.t, live.v, live.n);
         render(s);
         handler.postDelayed(tick, TICK_MS);
     }
 
-    private void pushLive(long t, float v) {
-        if (liveN == LIVE_CAP) {
-            System.arraycopy(liveT, 1, liveT, 0, LIVE_CAP - 1);
-            System.arraycopy(liveV, 1, liveV, 0, LIVE_CAP - 1);
-            liveN--;
-        }
-        liveT[liveN] = t;
-        liveV[liveN] = v;
-        liveN++;
-        chart.setRange(t - LIVE_WINDOW_MS, t);
-        chart.setData(liveT, liveV, liveN);
-    }
-
     private void render(BatterySnapshot s) {
+        LiveStats stats = live.stats;
         boolean f = prefs.bool(Prefs.FAHRENHEIT);
         int smoothing = prefs.integer(Prefs.SMOOTHING);
         int window = smoothing == 0 ? 1 : smoothing == 1 ? 10 : 30;
-        int shown = s.hasCurrent() ? (stats.isEmpty() ? s.currentMa : stats.smoothed(window)) : BatterySnapshot.NONE;
+        int shown = !s.hasCurrent() ? BatterySnapshot.NONE
+                : stats.isEmpty() ? s.currentMa : stats.smoothed(window * 1000L, s.elapsed);
 
         // State pill and card tint
         String state;
@@ -262,11 +289,9 @@ public final class DashboardPage extends Page {
                 design > 0 ? "Design " + Fmt.mah(design) : "Design capacity unknown");
         renderTime(s, full, design);
 
-        String unit = prefs.bool(Prefs.LEARNED_MICROAMPS) ? "µA" : "mA";
-        String sign = prefs.bool(Prefs.LEARNED_INVERTED) ? "inverted" : "normal";
-        footnote.setText(String.format(Locale.US,
-                "Raw current %s, sign %s (auto-detected; override in Settings). %d samples since reset.",
-                unit, sign, stats.samples()));
+        footnote.setText(String.format(Locale.US, "Raw current in %s. Min/avg/max cover %d readings taken "
+                + "while this screen was open since you last plugged in or unplugged.",
+                BatteryReader.conventionSummary(prefs), stats.samples()));
     }
 
     private String tempNote(float c) {
@@ -288,6 +313,7 @@ public final class DashboardPage extends Page {
     }
 
     private void renderTime(BatterySnapshot s, double full, int design) {
+        LiveStats stats = live.stats;
         double cap = !Double.isNaN(full) ? full : design;
         if (s.isPlugged()) {
             if (s.isFull()) {

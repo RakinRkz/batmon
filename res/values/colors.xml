@@ -18,4 +18,5 @@
     <color name="serious">#EC835A</color>
     <color name="critical">#D03B3B</color>
     <color name="launcher_bg">#12784A</color>
+    <color name="nav_bar_api26">#99000000</color>
 </resources>

@@ -10,9 +10,9 @@ import android.view.View;
 import android.view.ViewConfiguration;
 
 import java.text.SimpleDateFormat;
+import java.util.Calendar;
 import java.util.Date;
 import java.util.Locale;
-import java.util.TimeZone;
 
 /**
  * Single-series time chart: 2dp line over a 12% wash, hairline grid, clean y ticks, time ticks,
@@ -329,9 +329,29 @@ public final class ChartView extends View {
         boolean is24 = android.text.format.DateFormat.is24HourFormat(getContext());
         SimpleDateFormat f = new SimpleDateFormat(step >= DAY ? "EEE d" : is24 ? "HH:mm" : "h:mm a",
                 Locale.getDefault());
-        long off = TimeZone.getDefault().getOffset(x0);
-        long first = ((x0 + off) / step + 1) * step - off;
-        for (long t = first; t <= x1; t += step) drawTick(c, t, f.format(new Date(t)), y);
+        // Ticks restart from each local midnight, so days that daylight saving makes 23 or 25 hours
+        // long don't shift every later tick (and its day label) by an hour.
+        Calendar cal = Calendar.getInstance();
+        cal.setTimeInMillis(x0);
+        cal.set(Calendar.HOUR_OF_DAY, 0);
+        cal.set(Calendar.MINUTE, 0);
+        cal.set(Calendar.SECOND, 0);
+        cal.set(Calendar.MILLISECOND, 0);
+        if (step >= DAY) {
+            for (; cal.getTimeInMillis() <= x1; cal.add(Calendar.DAY_OF_YEAR, (int) (step / DAY))) {
+                long t = cal.getTimeInMillis();
+                if (t >= x0) drawTick(c, t, f.format(new Date(t)), y);
+            }
+            return;
+        }
+        while (cal.getTimeInMillis() <= x1) {
+            long dayStart = cal.getTimeInMillis();
+            cal.add(Calendar.DAY_OF_YEAR, 1);
+            long dayEnd = cal.getTimeInMillis();
+            for (long t = dayStart; t < dayEnd && t <= x1; t += step) {
+                if (t >= x0) drawTick(c, t, f.format(new Date(t)), y);
+            }
+        }
     }
 
     private void drawTick(Canvas c, long t, String label, float y) {

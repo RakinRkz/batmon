@@ -16,8 +16,8 @@ import android.graphics.Typeface;
 import android.graphics.drawable.Icon;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
-import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
@@ -28,6 +28,9 @@ import java.util.Locale;
  * Foreground service behind the live notification: samples the battery, logs history, tracks
  * sessions and raises alerts. Samples often while the screen is on, rarely while it is off, and
  * (optionally) holds a wakelock while charging so charge sessions are measured without gaps.
+ *
+ * Sampling, database writes and notifications run on one worker thread; the main thread only
+ * starts and stops the service.
  */
 public final class MonitorService extends Service {
     private static final String TAG = "BatMon";
@@ -39,7 +42,8 @@ public final class MonitorService extends Service {
     private static final long MIN_BROADCAST_TICK_MS = 20_000;
     private static final long PRUNE_EVERY_MS = 6 * 3_600_000L;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private HandlerThread thread;
+    private Handler handler;
     private final Runnable tick = this::tick;
     private BatteryReader reader;
     private Prefs prefs;
@@ -48,9 +52,13 @@ public final class MonitorService extends Service {
     private PowerManager pm;
     private NotificationManager nm;
     private PowerManager.WakeLock wakeLock;
-    private BatterySnapshot lastSnapshot;
-    private long lastLogTs, lastPruneTs, lastTickUptime;
-    private boolean lastNotifiedPlugged;
+    private volatile BatterySnapshot lastSnapshot;
+    private volatile boolean stopped;
+    // Worker-thread state. Times are elapsedRealtime, which keeps counting in deep sleep and
+    // ignores wall-clock changes.
+    private long lastLogAt = -1, lastPruneAt = -1, lastTickAt = -1;
+    private volatile String lastNotificationKey;
+    private volatile boolean lastNotifiedPlugged;
 
     public static void start(Context c) {
         try {
@@ -74,6 +82,7 @@ public final class MonitorService extends Service {
         }
     }
 
+    /** Delivered on the worker thread (see registerReceiver below). */
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context c, Intent i) {
@@ -83,7 +92,7 @@ public final class MonitorService extends Service {
             } else if (Intent.ACTION_SCREEN_ON.equals(a) || Intent.ACTION_SCREEN_OFF.equals(a)) {
                 schedule(0);
             } else if (Intent.ACTION_BATTERY_CHANGED.equals(a)
-                    && SystemClock.uptimeMillis() - lastTickUptime > MIN_BROADCAST_TICK_MS) {
+                    && (lastTickAt < 0 || SystemClock.elapsedRealtime() - lastTickAt > MIN_BROADCAST_TICK_MS)) {
                 schedule(0); // level changes wake the phone; record them even with the screen off
             }
         }
@@ -95,39 +104,56 @@ public final class MonitorService extends Service {
         reader = new BatteryReader(this);
         prefs = Prefs.get(this);
         db = HistoryDb.get(this);
-        tracker = new SessionTracker(db);
+        tracker = new SessionTracker(db, () -> BatteryReader.designCapacityMah(this));
         pm = getSystemService(PowerManager.class);
         nm = getSystemService(NotificationManager.class);
         Alerts.ensureChannels(this);
         lastSnapshot = reader.read();
         goForeground(lastSnapshot);
 
+        thread = new HandlerThread("BatMonMonitor");
+        thread.start();
+        handler = new Handler(thread.getLooper());
         IntentFilter f = new IntentFilter();
         f.addAction(Intent.ACTION_SCREEN_ON);
         f.addAction(Intent.ACTION_SCREEN_OFF);
         f.addAction(Intent.ACTION_POWER_CONNECTED);
         f.addAction(Intent.ACTION_POWER_DISCONNECTED);
         f.addAction(Intent.ACTION_BATTERY_CHANGED);
-        registerReceiver(receiver, f); // system broadcasts only, so no export flag is needed
+        registerReceiver(receiver, f, null, handler); // system broadcasts only, so no export flag is needed
         schedule(0);
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         // Every start must be followed by startForeground, including refreshes and sticky restarts.
-        goForeground(lastSnapshot != null ? lastSnapshot : reader.read());
-        if (intent != null && ACTION_REFRESH.equals(intent.getAction())) schedule(0);
+        goForeground(lastSnapshot);
+        if (intent != null && ACTION_REFRESH.equals(intent.getAction())) {
+            lastNotificationKey = null; // settings may have changed what the notification shows
+            schedule(0);
+        }
         return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
-        handler.removeCallbacksAndMessages(null);
+        stopped = true;
         try {
             unregisterReceiver(receiver);
         } catch (IllegalArgumentException ignored) {
         }
-        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        handler.removeCallbacksAndMessages(null);
+        // Runs after any tick already in progress, so nothing re-posts the notification afterwards.
+        handler.post(() -> {
+            try {
+                tracker.closeOpen();
+            } catch (RuntimeException e) {
+                Log.e(TAG, "closing session failed", e);
+            }
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+            nm.cancel(Alerts.ID_MONITOR);
+            thread.quitSafely();
+        });
         super.onDestroy();
     }
 
@@ -137,46 +163,52 @@ public final class MonitorService extends Service {
     }
 
     private void schedule(long delayMs) {
+        if (stopped) return;
         handler.removeCallbacks(tick);
         handler.postDelayed(tick, delayMs);
     }
 
     private void tick() {
-        lastTickUptime = SystemClock.uptimeMillis();
+        if (stopped) return;
         BatterySnapshot s = reader.read();
+        lastTickAt = s.elapsed;
         boolean screenOn = pm.isInteractive();
         try {
             tracker.onSample(s, screenOn);
-            if (s.time - lastLogTs >= MIN_LOG_INTERVAL_MS) {
+            if (lastLogAt < 0 || s.elapsed - lastLogAt >= MIN_LOG_INTERVAL_MS) {
                 db.insertSample(s, screenOn);
-                lastLogTs = s.time;
+                lastLogAt = s.elapsed;
             }
-            if (s.time - lastPruneTs > PRUNE_EVERY_MS) {
+            if (lastPruneAt < 0 || s.elapsed - lastPruneAt > PRUNE_EVERY_MS) {
                 long day = 86_400_000L;
                 db.prune(s.time - prefs.integer(Prefs.HISTORY_DAYS) * day, s.time - 365 * day);
-                lastPruneTs = s.time;
+                lastPruneAt = s.elapsed;
             }
         } catch (RuntimeException e) {
             Log.e(TAG, "history write failed", e);
         }
-        Alerts.check(this, s, tracker.current());
-        if (screenOn || s.isPlugged() != lastNotifiedPlugged) {
-            nm.notify(Alerts.ID_MONITOR, buildNotification(s));
-            lastNotifiedPlugged = s.isPlugged();
-        }
-        updateWakeLock(s);
+        Alerts.check(this, s);
+        if (screenOn || s.isPlugged() != lastNotifiedPlugged) postNotification(s);
+        boolean measuring = wantWakeLock(s);
+        updateWakeLock(measuring);
         lastSnapshot = s;
 
         long next;
         if (screenOn) next = prefs.integer(Prefs.INTERVAL) * 1000L;
-        else if (s.isPlugged() && prefs.bool(Prefs.KEEP_AWAKE_CHARGING)) next = CHARGING_SCREEN_OFF_INTERVAL_MS;
+        else if (measuring) next = CHARGING_SCREEN_OFF_INTERVAL_MS;
         else next = SCREEN_OFF_INTERVAL_MS;
         schedule(next);
     }
 
-    private void updateWakeLock(BatterySnapshot s) {
-        // Only while charge is still flowing in; a full battery on the charger needs no measuring.
-        boolean want = s.isPlugged() && !s.isFull() && s.level < 100 && prefs.bool(Prefs.KEEP_AWAKE_CHARGING);
+    /**
+     * Only while the battery is actually charging: not when it is full, held at an OS charge
+     * limit, or paused for heat (all of which report a status other than CHARGING).
+     */
+    private boolean wantWakeLock(BatterySnapshot s) {
+        return s.isPlugged() && s.isCharging() && s.level < 100 && prefs.bool(Prefs.KEEP_AWAKE_CHARGING);
+    }
+
+    private void updateWakeLock(boolean want) {
         if (want) {
             if (wakeLock == null) {
                 wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BatMon:charging");
@@ -189,7 +221,9 @@ public final class MonitorService extends Service {
     }
 
     private void goForeground(BatterySnapshot s) {
-        Notification n = buildNotification(s);
+        Content content = new Content(s);
+        Notification n = build(content);
+        lastNotificationKey = content.key;
         lastNotifiedPlugged = s.isPlugged();
         try {
             if (Build.VERSION.SDK_INT >= 34) {
@@ -205,23 +239,73 @@ public final class MonitorService extends Service {
         }
     }
 
-    private Notification buildNotification(BatterySnapshot s) {
-        boolean f = prefs.bool(Prefs.FAHRENHEIT);
-        String state;
-        if (!s.isPlugged()) state = "Discharging";
-        else if (s.isFull()) state = "Full";
-        else state = "Charging";
-        String title = state + "  " + Fmt.signedMa(s.currentMa) + " mA  ·  "
-                + Fmt.watts(s.powerW(s.currentMa)) + " W";
-        StringBuilder text = new StringBuilder();
-        text.append(s.level).append(" %  ·  ").append(Fmt.temp(s.tempC, f))
-                .append("  ·  ").append(Fmt.volts(s.voltageMv));
-        if (s.isPlugged()) text.append("  ·  ").append(Fmt.plug(s.plugged));
+    /** Re-posts only when what the notification shows has changed. */
+    private void postNotification(BatterySnapshot s) {
+        Content content = new Content(s);
+        lastNotifiedPlugged = s.isPlugged();
+        if (content.key.equals(lastNotificationKey)) return;
+        lastNotificationKey = content.key;
+        nm.notify(Alerts.ID_MONITOR, build(content));
+    }
 
+    /** The notification's text and status-bar icon, computed once per sample. */
+    private final class Content {
+        final String title, text, iconTop, iconBottom, key;
+
+        Content(BatterySnapshot s) {
+            boolean f = prefs.bool(Prefs.FAHRENHEIT);
+            String state;
+            if (!s.isPlugged()) state = "Discharging";
+            else if (s.isFull()) state = "Full";
+            else state = "Charging";
+            title = state + "  " + Fmt.signedMa(s.currentMa) + " mA  ·  "
+                    + Fmt.watts(s.powerW(s.currentMa)) + " W";
+            StringBuilder t = new StringBuilder();
+            t.append(s.level).append(" %  ·  ").append(Fmt.temp(s.tempC, f))
+                    .append("  ·  ").append(Fmt.volts(s.voltageMv));
+            if (s.isPlugged()) t.append("  ·  ").append(Fmt.plug(s.plugged));
+            text = t.toString();
+
+            String top = null, bottom = null;
+            switch (prefs.string(Prefs.NOTIF_ICON)) {
+                case "level":
+                    if (s.level >= 0) {
+                        top = String.valueOf(s.level);
+                        bottom = "%";
+                    }
+                    break;
+                case "temp":
+                    if (!Float.isNaN(s.tempC)) {
+                        top = String.valueOf(Math.round(Fmt.tempValue(s.tempC, f)));
+                        bottom = Fmt.tempUnit(f);
+                    }
+                    break;
+                default:
+                    if (s.hasCurrent()) {
+                        int abs = Math.abs(s.currentMa);
+                        String sign = s.currentMa < 0 ? "-" : "";
+                        if (abs >= 1000) {
+                            top = sign + String.format(Locale.US, "%.1f", abs / 1000f);
+                            bottom = "A";
+                        } else {
+                            top = sign + abs;
+                            bottom = "mA";
+                        }
+                    }
+            }
+            iconTop = top;
+            iconBottom = bottom;
+            key = title + '\n' + text + '\n' + top + '\n' + bottom;
+        }
+    }
+
+    private Notification build(Content c) {
+        Icon icon = c.iconTop != null ? Icon.createWithBitmap(textIcon(c.iconTop, c.iconBottom))
+                : Icon.createWithResource(this, R.drawable.ic_stat_bolt);
         Notification.Builder b = new Notification.Builder(this, Alerts.CH_MONITOR)
-                .setSmallIcon(statusIcon(s, f))
-                .setContentTitle(title)
-                .setContentText(text)
+                .setSmallIcon(icon)
+                .setContentTitle(c.title)
+                .setContentText(c.text)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setShowWhen(false)
@@ -233,34 +317,6 @@ public final class MonitorService extends Service {
     }
 
     /** Status-bar icon drawn as text: a number over its unit. */
-    private Icon statusIcon(BatterySnapshot s, boolean fahrenheit) {
-        String top, bottom;
-        switch (prefs.string(Prefs.NOTIF_ICON)) {
-            case "level":
-                if (s.level < 0) return Icon.createWithResource(this, R.drawable.ic_stat_bolt);
-                top = String.valueOf(s.level);
-                bottom = "%";
-                break;
-            case "temp":
-                if (Float.isNaN(s.tempC)) return Icon.createWithResource(this, R.drawable.ic_stat_bolt);
-                top = String.valueOf(Math.round(Fmt.tempValue(s.tempC, fahrenheit)));
-                bottom = Fmt.tempUnit(fahrenheit);
-                break;
-            default:
-                if (!s.hasCurrent()) return Icon.createWithResource(this, R.drawable.ic_stat_bolt);
-                int abs = Math.abs(s.currentMa);
-                String sign = s.currentMa < 0 ? "-" : "";
-                if (abs >= 1000) {
-                    top = sign + String.format(Locale.US, "%.1f", abs / 1000f);
-                    bottom = "A";
-                } else {
-                    top = sign + abs;
-                    bottom = "mA";
-                }
-        }
-        return Icon.createWithBitmap(textIcon(top, bottom));
-    }
-
     private static Bitmap textIcon(String top, String bottom) {
         int size = 96;
         Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);

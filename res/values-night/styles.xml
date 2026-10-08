@@ -7,7 +7,8 @@
         <item name="android:colorPrimary">@color/page</item>
         <item name="android:colorAccent">@color/accent</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
-        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- API 26 can't darken the navigation buttons, so it gets a scrim; v27 clears it. -->
+        <item name="android:navigationBarColor">@color/nav_bar_api26</item>
         <item name="android:windowLightStatusBar">@bool/light_bars</item>
     </style>
 </resources>

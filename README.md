@@ -16,8 +16,8 @@ phone.
 ## Features
 
 - **Live current.** Charging current shows as positive and discharging current as negative, in mA,
-  averaged with outliers trimmed. The screen also shows power in watts, min/avg/max since you plugged
-  in or unplugged, and a 3-minute chart you can drag across to read exact values.
+  averaged with outliers trimmed. The screen also shows power in watts, min/avg/max of what it measured
+  since you last plugged in or unplugged, and a 3-minute chart you can drag across to read exact values.
   - A banner warns when the phone is plugged in but still draining, for example a weak USB port with
     the screen on.
 - **Every battery value.** Level, temperature, voltage, health, power source, technology, remaining
@@ -29,10 +29,13 @@ phone.
   3. Remaining charge ÷ battery level.
 - **History.** Charts of battery level, current and temperature over 6 hours to 7 days, plus a list of
   charge and discharge sessions. Discharge sessions show average drain with the screen on and with it off.
+  Chart data is kept for 7 to 90 days (your choice); sessions are kept for a year.
 - **Live notification.** A status-bar icon shows the current in mA, the battery level, or the
   temperature. The notification shows current, power, level, temperature and voltage.
-- **Alerts.** A charge-limit alert (80 % by default) helps you avoid long stretches at 100 %. There are
-  also low-battery and high-temperature alerts.
+- **Alerts.** A charge-limit alert (80 % by default) fires when charging reaches the limit, and helps you
+  avoid long stretches at 100 %. Plugging in a phone that's already above the limit stays quiet. There
+  are also low-battery and high-temperature alerts. Each alert fires once per crossing, so a loose cable
+  doesn't repeat it.
 - **Light and dark themes** follow the system setting.
 
 ## Install
@@ -44,8 +47,9 @@ phone.
    To check both, run `sha256sum BatMon-*.apk` and `apksigner verify --print-certs BatMon-*.apk`.
 3. Open the APK on your phone and allow installs from that source when Android asks.
 
-BatMon needs Android 8.0 or later. For uninterrupted history, open **Settings → Background
-restrictions** in the app and allow unrestricted battery use.
+BatMon needs Android 8.0 or later. It is tested on a Samsung Galaxy M31 running LineageOS
+(Android 16); other phones should work, but see [Accuracy](#accuracy). For uninterrupted history, open
+**Settings → Background restrictions** in the app and allow unrestricted battery use.
 
 ## Accuracy
 
@@ -100,5 +104,6 @@ version and the raw battery values (see [Accuracy](#accuracy)).
 
 ## License
 
-BatMon is free software under the [GNU General Public License v3.0](LICENSE). The design was inspired
-by Ampere. BatMon is not affiliated with Ampere or its developers.
+BatMon is free software under the [GNU General Public License v3.0](LICENSE). Its icons reuse Google's
+Material Icons under the Apache License 2.0; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The
+design was inspired by Ampere. BatMon is not affiliated with Ampere or its developers.

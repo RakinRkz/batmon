@@ -13,7 +13,7 @@
 #   APK_NAME (default: project dir name)  MIN_SDK (26)  TARGET_SDK (= platform)
 #   VERSION_CODE (1)  VERSION_NAME (1.0)  JAVA_RELEASE (8)
 #   ANDROID_MIN_TOOLCHAIN, ANDROID_PLATFORM (35), ANDROID_BUILD_TOOLS (35.0.0)
-#   KEYSTORE, KEY_ALIAS, KS_PASS: release signing; otherwise a per-machine debug key is used.
+#   Release signing reads KEYSTORE, KEY_ALIAS and the KS_PASS variable; without them a per-machine debug key is used.
 set -euo pipefail
 
 project=$(cd "${1:-.}" && pwd)

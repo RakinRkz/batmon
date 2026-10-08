@@ -61,20 +61,25 @@ public final class HistoryDb extends SQLiteOpenHelper {
         getWritableDatabase().insertWithOnConflict("samples", null, v, SQLiteDatabase.CONFLICT_REPLACE);
     }
 
-    /** Time series averaged into buckets so that at most {@code maxPoints} rows come back. */
+    /**
+     * Time series averaged into buckets so that at most {@code maxPoints} rows come back. Each point
+     * sits at the mean time of its samples, so it never falls outside [from, to].
+     */
     public static final class Series {
         public long[] t;
         public float[] current, level, temp;
         public int n;
+        public long bucketMs;
     }
 
     public Series series(long from, long to, int maxPoints) {
         long bucket = Math.max(1000, (to - from) / maxPoints);
         Series s = new Series();
+        s.bucketMs = bucket;
         try (Cursor c = getReadableDatabase().rawQuery(
-                "SELECT (ts / ?) * ? AS t, AVG(current_ma), AVG(level), AVG(temp_dc) FROM samples"
+                "SELECT AVG(ts) AS t, AVG(current_ma), AVG(level), AVG(temp_dc) FROM samples"
                         + " WHERE ts BETWEEN ? AND ? GROUP BY ts / ? ORDER BY t",
-                new String[] {str(bucket), str(bucket), str(from), str(to), str(bucket)})) {
+                new String[] {str(from), str(to), str(bucket)})) {
             int n = c.getCount();
             s.t = new long[n];
             s.current = new float[n];
@@ -82,7 +87,7 @@ public final class HistoryDb extends SQLiteOpenHelper {
             s.temp = new float[n];
             int i = 0;
             while (c.moveToNext()) {
-                s.t[i] = c.getLong(0) + bucket / 2;
+                s.t[i] = (long) c.getDouble(0);
                 s.current[i] = c.isNull(1) ? Float.NaN : c.getFloat(1);
                 s.level[i] = c.isNull(2) ? Float.NaN : c.getFloat(2);
                 s.temp[i] = c.isNull(3) ? Float.NaN : c.getFloat(3) / 10f;
@@ -113,12 +118,6 @@ public final class HistoryDb extends SQLiteOpenHelper {
         return arr[arr.length / 2];
     }
 
-    public long sampleCount() {
-        try (Cursor c = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM samples", null)) {
-            return c.moveToFirst() ? c.getLong(0) : 0;
-        }
-    }
-
     // ---- sessions ----
 
     public long insertSession(Session s) {
@@ -126,8 +125,9 @@ public final class HistoryDb extends SQLiteOpenHelper {
         return s.id;
     }
 
-    public void updateSession(Session s) {
-        getWritableDatabase().update("sessions", values(s), "_id = ?", new String[] {str(s.id)});
+    /** False when the row no longer exists (Clear history ran). */
+    public boolean updateSession(Session s) {
+        return getWritableDatabase().update("sessions", values(s), "_id = ?", new String[] {str(s.id)}) > 0;
     }
 
     public void deleteSession(long id) {
@@ -147,9 +147,10 @@ public final class HistoryDb extends SQLiteOpenHelper {
         return sessions("charge = 1 AND end_level - start_level >= " + Session.MIN_ESTIMATE_DELTA, null);
     }
 
-    /** Total mAh pushed into the battery across all recorded charge sessions. */
+    /** Total mAh pushed into the battery across all recorded charge sessions (net drains count as 0). */
     public double totalChargedMah() {
-        try (Cursor c = getReadableDatabase().rawQuery("SELECT SUM(mah) FROM sessions WHERE charge = 1", null)) {
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT SUM(MAX(mah, 0)) FROM sessions WHERE charge = 1",
+                null)) {
             return c.moveToFirst() && !c.isNull(0) ? c.getDouble(0) : 0;
         }
     }
